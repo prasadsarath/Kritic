@@ -1,0 +1,156 @@
+import json
+import os
+import time
+import uuid
+import base64
+import boto3
+from boto3.dynamodb.conditions import Key, Attr
+from datetime import datetime, timezone
+
+TABLE_NAME = os.getenv("TABLE_NAME", "critic_taggedusersproximity")
+dynamodb = boto3.resource("dynamodb")
+table = dynamodb.Table(TABLE_NAME)
+
+def _cors():
+    return {
+        "Access-Control-Allow-Origin": "*",
+        "Access-Control-Allow-Headers": "Content-Type,Authorization",
+        "Access-Control-Allow-Methods": "GET,POST,OPTIONS"
+    }
+
+def _resp(code: int, obj: dict):
+    return {"statusCode": code, "headers": _cors(), "body": json.dumps(obj)}
+
+def _now_epoch() -> int: return int(time.time())
+def _now_iso() -> str:   return datetime.now(timezone.utc).isoformat()
+
+def list_active(user_id: str):
+    """Return active (tag_status==True and not expired) tags for this user_id."""
+    now = _now_epoch()
+    try:
+        resp = table.query(KeyConditionExpression=Key("user_id").eq(user_id))
+        items = resp.get("Items", [])
+    except Exception as e:
+        print(f"[Lambda][ERROR] Query failed: {e}")
+        # Fall back to scan if schema differs
+        scan = table.scan(FilterExpression=Attr("user_id").eq(user_id))
+        items = scan.get("Items", [])
+
+    active = []
+    for it in items:
+        tag_ok = it.get("tag_status") is True
+        exp = int(it.get("expiresAt", 0)) if str(it.get("expiresAt", "0")).isdigit() else 0
+        if tag_ok and exp > now:
+            active.append({
+                "taggedUserId": it.get("tagged_user_id") or it.get("taggedUserId") or it.get("id"),
+                "expiresAt": exp,
+                "taggedAt": it.get("updatedAt") or it.get("timestamp")
+            })
+    print(f"[Lambda] list_active user_id={user_id} -> {len(active)} items")
+    return active
+
+def tag_user(user_id: str, tagged_user_id: str):
+    expires_at = _now_epoch() + 24 * 3600
+    item = {
+        "user_id": user_id,
+        "tagged_user_id": tagged_user_id,   # recommended as sort key
+        "id": str(uuid.uuid4()),
+        "timestamp": _now_iso(),
+        "tag_status": True,
+        "expiresAt": expires_at,
+        "updatedAt": _now_iso(),
+    }
+    table.put_item(Item=item)
+    print(f"[Lambda] TAG user_id={user_id} -> tagged_user_id={tagged_user_id} exp={expires_at}")
+    return {"status": True, "message": "Tagged", "expiresAt": expires_at}
+
+def _find_item(user_id: str, tagged_user_id: str):
+    """Find a matching item by user_id + tagged_user_id, return the full item or None."""
+    try:
+        # Fast path: query by user_id then filter
+        resp = table.query(KeyConditionExpression=Key("user_id").eq(user_id))
+        items = resp.get("Items", [])
+    except Exception as e:
+        print(f"[Lambda][WARN] query failed, scanning: {e}")
+        items = table.scan(FilterExpression=Attr("user_id").eq(user_id)).get("Items", [])
+
+    for it in items:
+        if (it.get("tagged_user_id") or it.get("taggedUserId")) == tagged_user_id:
+            return it
+    return None
+
+def untag_user(user_id: str, tagged_user_id: str):
+    # 1) Try hard delete by (user_id, tagged_user_id)
+    try:
+        table.delete_item(Key={"user_id": user_id, "tagged_user_id": tagged_user_id})
+        print(f"[Lambda] UNTAG delete key (user_id={user_id}, tagged_user_id={tagged_user_id})")
+        return {"status": True, "message": "Untagged"}
+    except Exception as e:
+        print(f"[Lambda][WARN] delete failed, will try overwrite put: {e}")
+
+    # 2) Find the item and overwrite with tag_status=False (idempotent)
+    it = _find_item(user_id, tagged_user_id)
+    if not it:
+        print(f"[Lambda] UNTAG nothing to do (no item) for user_id={user_id} tagged_user_id={tagged_user_id}")
+        return {"status": True, "message": "Untagged (no-op)"}
+
+    it["tag_status"] = False
+    it["expiresAt"]  = _now_epoch()    # expire immediately
+    it["updatedAt"]  = _now_iso()
+
+    try:
+        table.put_item(Item=it)
+        print(f"[Lambda] UNTAG overwrite put for user_id={user_id} tagged_user_id={tagged_user_id}")
+        return {"status": True, "message": "Untagged"}
+    except Exception as e:
+        print(f"[Lambda][ERROR] put_item failed during untag: {e}")
+        raise
+
+def lambda_handler(event, context):
+    method = (
+        event.get("requestContext", {}).get("http", {}).get("method")
+        or event.get("httpMethod")
+        or "GET"
+    )
+    print(f"[Lambda] method={method}")
+
+    if method == "OPTIONS":
+        return {"statusCode": 204, "headers": _cors(), "body": ""}
+
+    if method == "GET":
+        q = event.get("queryStringParameters") or {}
+        user_id = (q.get("userId") or "").strip()
+        print(f"[Lambda] GET list userId={user_id}")
+        if not user_id:
+            return _resp(400, {"status": False, "message": "Missing userId"})
+        items = list_active(user_id)
+        return _resp(200, {"status": True, "userId": user_id, "count": len(items), "taggedUsers": items})
+
+    if method == "POST":
+        try:
+            body_raw = event.get("body") or "{}"
+            if event.get("isBase64Encoded"):
+                body_raw = base64.b64decode(body_raw).decode("utf-8")
+            body = json.loads(body_raw)
+        except Exception:
+            return _resp(400, {"status": False, "message": "Invalid JSON body"})
+
+        action = (body.get("action") or "").strip().lower()
+        user_id = (body.get("userId") or "").strip()
+        tagged_user_id = (body.get("taggedUserId") or "").strip()
+
+        print(f"[Lambda] POST action={action} userId={user_id} taggedUserId={tagged_user_id}")
+
+        if action not in {"tag", "untag"}:
+            return _resp(400, {"status": False, "message": "action must be 'tag' or 'untag'"})
+        if not user_id or not tagged_user_id:
+            return _resp(400, {"status": False, "message": "userId and taggedUserId are required"})
+
+        if action == "tag":
+            out = tag_user(user_id, tagged_user_id)
+            return _resp(200, out)
+        else:
+            out = untag_user(user_id, tagged_user_id)
+            return _resp(200, out)
+
+    return _resp(405, {"status": False, "message": "Method not allowed"})

@@ -1,0 +1,76 @@
+import json
+import uuid
+from datetime import datetime, timezone
+
+ALLOWED_REASONS = ["spam", "harassment", "other"]
+
+def _cors():
+    return {
+        "Access-Control-Allow-Origin": "*",
+        "Access-Control-Allow-Headers": "Content-Type,Authorization",
+        "Access-Control-Allow-Methods": "GET,POST,OPTIONS"
+    }
+
+def _resp(code: int, obj: dict):
+    return {"statusCode": code, "headers": _cors(), "body": json.dumps(obj)}
+
+def lambda_handler(event, context):
+    # Detect HTTP method for both Function URL (v2) and API GW (v1)
+    method = (
+        event.get("requestContext", {}).get("http", {}).get("method")
+        or event.get("httpMethod")
+        or "GET"
+    )
+
+    # CORS preflight
+    if method == "OPTIONS":
+        return {"statusCode": 204, "headers": _cors(), "body": ""}
+
+    if method == "GET":
+        # Return available report items
+        return _resp(200, {"items": ALLOWED_REASONS})
+
+    if method == "POST":
+        try:
+            body_raw = event.get("body") or "{}"
+            # Function URLs sometimes base64-encode; API GW usually not
+            if event.get("isBase64Encoded"):
+                import base64
+                body_raw = base64.b64decode(body_raw).decode("utf-8")
+            body = json.loads(body_raw)
+        except Exception:
+            return _resp(400, {"error": "Invalid JSON body"})
+
+        # Normalize and validate the reason
+        reason = (body.get("reason") or "").strip().lower()
+        if reason not in ALLOWED_REASONS:
+            return _resp(400, {
+                "status": False,
+                "message": "Invalid reason. Use one of: spam, harassment, other."
+            })
+
+        # (Optional) include additional fields your app may send:
+        reporter_id = body.get("reporterId")  # optional
+        target_id   = body.get("targetId")    # optional
+        target_type = body.get("targetType")  # e.g., "user" | "post" | "comment" (optional)
+        details     = body.get("details")     # optional free text
+
+        # (Optional) persist to a DB here. For now, we just echo a success payload.
+        report_id = str(uuid.uuid4())
+        now_iso = datetime.now(timezone.utc).isoformat()
+
+        return _resp(200, {
+            "status": True,
+            "reportId": report_id,
+            "acceptedReason": reason,
+            "timestamp": now_iso,
+            "echo": {
+                "reporterId": reporter_id,
+                "targetId": target_id,
+                "targetType": target_type,
+                "details": details
+            }
+        })
+
+    # Anything else
+    return _resp(405, {"error": "Method not allowed"})

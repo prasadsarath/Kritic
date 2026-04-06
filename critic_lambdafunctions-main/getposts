@@ -1,0 +1,202 @@
+import json
+import os
+import boto3
+from boto3.dynamodb.conditions import Attr
+
+REGION = os.environ.get("AWS_REGION", "us-east-1")
+
+POSTS_TABLE_NAME = os.environ.get("TABLE_NAME", "poststable")
+USERS_TABLE_NAME = os.environ.get("USERS_TABLE_NAME", "Users")
+
+dynamodb = boto3.resource("dynamodb", region_name=REGION)
+posts_table = dynamodb.Table(POSTS_TABLE_NAME)
+
+ddb_client = boto3.client("dynamodb", region_name=REGION)
+
+# we will try to match user from any of these user fields
+USER_ID_FIELDS = ["userId", "id", "pk", "user_id", "UserId"]
+
+
+def _cors():
+    return {
+        "Access-Control-Allow-Origin": "*",
+        "Access-Control-Allow-Headers": "Content-Type,Authorization",
+        "Access-Control-Allow-Methods": "GET,OPTIONS"
+    }
+
+
+def _scan_posts(filter_expr):
+    items, start_key = [], None
+    while True:
+        kwargs = {"FilterExpression": filter_expr}
+        if start_key:
+            kwargs["ExclusiveStartKey"] = start_key
+        resp = posts_table.scan(**kwargs)
+        items.extend(resp.get("Items", []))
+        start_key = resp.get("LastEvaluatedKey")
+        if not start_key:
+            break
+    return items
+
+
+def _scan_users_table():
+    """
+    FULL scan of Users table and return list of plain dicts.
+    Works regardless of PK name.
+    """
+    users = []
+    start_key = None
+    while True:
+        kwargs = {"TableName": USERS_TABLE_NAME}
+        if start_key:
+            kwargs["ExclusiveStartKey"] = start_key
+        resp = ddb_client.scan(**kwargs)
+        for item in resp.get("Items", []):
+            # convert wire format to simple dict
+            simple = {}
+            for k, v in item.items():
+                if "S" in v:
+                    simple[k] = v["S"]
+                elif "N" in v:
+                    simple[k] = v["N"]
+                else:
+                    simple[k] = v
+            users.append(simple)
+
+        start_key = resp.get("LastEvaluatedKey")
+        if not start_key:
+            break
+
+    return users
+
+
+def _build_users_map(scanned_users, wanted_ids):
+    """
+    scanned_users: list of dicts from Users table
+    wanted_ids: set of userIds we saw in posts (already stripped)
+    return: { userId_from_posts: user_object }
+    """
+    wanted_norm = {uid.strip(): uid.strip() for uid in wanted_ids if uid}
+    out = {}
+    # also collect which ids we managed to match
+    matched = []
+
+    for u in scanned_users:
+        # find any possible id field
+        possible_ids = []
+        for f in USER_ID_FIELDS:
+            val = u.get(f)
+            if val:
+                possible_ids.append(val.strip())
+
+        if not possible_ids:
+            continue
+
+        # if any of those ids is in wanted, map it
+        for pid in possible_ids:
+            if pid in wanted_norm:
+                out[pid] = {
+                    "userId": u.get("userId") or u.get("id") or u.get("pk") or u.get("user_id") or u.get("UserId") or pid,
+                    "name": u.get("name") or u.get("aliasname"),
+                    "profile_url": u.get("profile_url"),
+                    "phone": u.get("phone"),
+                }
+                matched.append(pid)
+
+    return out, matched
+
+
+def _attach_users_to_posts(posts, users_map):
+    out = []
+    for p0 in posts:
+        p = dict(p0)
+        sid = (p.get("senderId") or "").strip()
+        rid = (p.get("receiverId") or "").strip()
+
+        if sid and sid in users_map:
+            p["sender"] = users_map[sid]
+        if rid and rid in users_map:
+            p["receiver"] = users_map[rid]
+
+        out.append(p)
+    return out
+
+
+def lambda_handler(event, context):
+    # CORS preflight
+    if event.get("httpMethod") == "OPTIONS":
+        return {"statusCode": 204, "headers": _cors(), "body": ""}
+
+    params = event.get("queryStringParameters") or {}
+    user_id = (params.get("userId") or "").strip()
+    debug_req = params.get("debug") == "1"
+
+    if not user_id:
+        return {
+            "statusCode": 400,
+            "headers": _cors(),
+            "body": json.dumps({"error": "userId query parameter required"})
+        }
+
+    try:
+        # 1) get my posts
+        my_posts = _scan_posts(Attr("senderId").eq(user_id))
+        # 2) get received posts
+        received_posts = _scan_posts(Attr("receiverId").eq(user_id))
+
+        # 3) collect all userIds from posts
+        all_user_ids = set()
+        for p in my_posts:
+            sid = (p.get("senderId") or "").strip()
+            rid = (p.get("receiverId") or "").strip()
+            if sid:
+                all_user_ids.add(sid)
+            if rid:
+                all_user_ids.add(rid)
+
+        for p in received_posts:
+            sid = (p.get("senderId") or "").strip()
+            rid = (p.get("receiverId") or "").strip()
+            if sid:
+                all_user_ids.add(sid)
+            if rid:
+                all_user_ids.add(rid)
+
+        # 4) scan Users table once
+        scanned_users = _scan_users_table()
+
+        # 5) build map from the scanned rows
+        users_map, matched_ids = _build_users_map(scanned_users, all_user_ids)
+
+        # 6) attach to posts
+        if users_map:
+            my_posts = _attach_users_to_posts(my_posts, users_map)
+            received_posts = _attach_users_to_posts(received_posts, users_map)
+
+        result = {
+            "myPosts": my_posts,
+            "receivedPosts": received_posts
+        }
+
+        if debug_req:
+            result["_debug"] = {
+                "usersTable": USERS_TABLE_NAME,
+                "requestedUserIds": list(all_user_ids),
+                "matchedUserIds": matched_ids,
+                "totalUsersScanned": len(scanned_users),
+                "userIdFieldsTried": USER_ID_FIELDS
+            }
+
+        return {
+            "statusCode": 200,
+            "headers": _cors(),
+            "body": json.dumps(result)
+        }
+
+    except Exception as e:
+        print("[ERROR]", e)
+        return {
+            "statusCode": 500,
+            "headers": _cors(),
+            "body": json.dumps({"error": str(e)})
+        }

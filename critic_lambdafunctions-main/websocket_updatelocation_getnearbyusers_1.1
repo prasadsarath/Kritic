@@ -1,0 +1,217 @@
+import boto3
+import json
+import time
+from decimal import Decimal
+from datetime import datetime, timezone
+from math import radians, cos, sin, asin, sqrt
+
+# --- CONFIGURATION ---
+AWS_REGION = "us-east-1"
+USERS_TABLE_NAME = "Users"
+LOC_TABLE_NAME = "UserLocations"
+
+dynamodb = boto3.resource("dynamodb", region_name=AWS_REGION)
+loc_table = dynamodb.Table(LOC_TABLE_NAME)
+
+# --- UTILITIES ---
+def decimal_default(obj):
+    if isinstance(obj, Decimal): return float(obj)
+    if isinstance(obj, datetime): return obj.isoformat()
+    raise TypeError(f"Type not serializable: {type(obj)}")
+
+def parse_body(event):
+    body = event.get("body", "{}")
+    if isinstance(body, dict): return body
+    if isinstance(body, str):
+        if body.strip() == "": return {}
+        try: return json.loads(body)
+        except json.JSONDecodeError: return {}
+    return {}
+
+def safe_float(value, default=None):
+    try:
+        if value is None or str(value).strip() == "": return default
+        return float(value)
+    except Exception: return default
+
+def send_ws_response(event, payload):
+    rc = event.get("requestContext", {})
+    connection_id = rc.get("connectionId")
+    domain_name = rc.get("domainName")
+    stage = rc.get("stage")
+
+    if not connection_id or not domain_name or not stage: return False
+    try:
+        api_gateway = boto3.client("apigatewaymanagementapi", endpoint_url=f"https://{domain_name}/{stage}")
+        api_gateway.post_to_connection(
+            ConnectionId=connection_id,
+            Data=json.dumps(payload, default=decimal_default).encode("utf-8")
+        )
+        return True
+    except Exception as e:
+        print(f"❌ WS Send Error: {e}")
+        return False
+
+def calculate_distance(lat1, lon1, lat2, lon2):
+    lat1, lon1, lat2, lon2 = map(radians, [lat1, lon1, lat2, lon2])
+    dlat, dlon = lat2 - lat1, lon2 - lon1
+    a = sin(dlat / 2) ** 2 + cos(lat1) * cos(lat2) * sin(dlon / 2) ** 2
+    a = max(0.0, min(1.0, a))
+    return 2 * asin(sqrt(a)) * 6371000
+
+def fetch_users_details(user_ids_set):
+    """ Fetch Name, Email, and Avatar ONLY for nearby users (Super Fast & Cheap) """
+    if not user_ids_set: return {}
+    user_ids = list(user_ids_set)
+    details_map = {}
+    
+    # Process up to 100 at a time (DynamoDB limit for Batch Get)
+    for i in range(0, len(user_ids), 100):
+        batch = user_ids[i:i+100]
+        # Assumes the partition key in your Users table is 'userId'
+        keys = [{'userId': uid} for uid in batch] 
+        try:
+            response = dynamodb.meta.client.batch_get_item(
+                RequestItems={USERS_TABLE_NAME: {'Keys': keys}}
+            )
+            for item in response.get('Responses', {}).get(USERS_TABLE_NAME, []):
+                uid = item.get('userId')
+                if uid:
+                    details_map[uid] = {
+                        "name": item.get('name', item.get('nickname', uid)),
+                        "email": item.get('email'), # <--- Extracts Email from DynamoDB Users Table
+                        "avatarUrl": item.get('profile_url', item.get('avatarUrl'))
+                    }
+        except Exception as e:
+            print(f"❌ Batch Get Users Error: {e}")
+            
+    return details_map
+
+# --- MAIN HANDLER ---
+def lambda_handler(event, context):
+    try:
+        body = parse_body(event)
+        action = str(body.get("action") or event.get("requestContext", {}).get("routeKey", "")).strip()
+        
+        # Connect/Disconnect
+        if action in ("$connect", "$disconnect"):
+            return {"statusCode": 200, "body": json.dumps({"ok": True})}
+
+        user_id = str(body.get("userId", "")).strip()
+        latitude = safe_float(body.get("latitude", body.get("lat")))
+        longitude = safe_float(body.get("longitude", body.get("lon")))
+
+        # -----------------------------------------------
+        # 1. Update Location (Fast Write Only)
+        # -----------------------------------------------
+        if action == "updateLocation":
+            if not user_id or latitude is None or longitude is None:
+                return {"statusCode": 400}
+                
+            server_time = datetime.now(timezone.utc).isoformat()
+            now_epoch = str(int(time.time()))
+            
+            loc_table.put_item(Item={
+                "userId": user_id,
+                "timestamp": now_epoch,
+                "latitude": Decimal(str(latitude)),
+                "longitude": Decimal(str(longitude)),
+                "updatedAt": server_time
+            })
+            
+            send_ws_response(event, {"status": True, "action": "updateLocationAck", "userId": user_id})
+            return {"statusCode": 200}
+
+        # -----------------------------------------------
+        # 2. Get Nearby Users (Read Locations + Attach Profiles)
+        # -----------------------------------------------
+        elif action == "getNearbyUsers":
+            radius = safe_float(body.get("radiusMeters"), 20)
+            if latitude is None or longitude is None: return {"statusCode": 400}
+
+            # Scan locations (Max 5 pages to prevent timeouts)
+            all_locs = []
+            start_key = None
+            for _ in range(5):
+                kwargs = {}
+                if start_key: kwargs["ExclusiveStartKey"] = start_key
+                resp = loc_table.scan(**kwargs)
+                all_locs.extend(resp.get("Items", []))
+                start_key = resp.get("LastEvaluatedKey")
+                if not start_key: break
+                
+            # Filter distinct latest location per user manually
+            latest_locs = {}
+            current_time = int(time.time())
+            
+            for loc in all_locs:
+                uid = loc.get("userId")
+                if not uid: continue
+                
+                # Get the timestamp the location was saved
+                ts_str = str(loc.get("timestamp", "0"))
+                try:
+                    ts = int(ts_str)
+                except ValueError:
+                    ts = 0
+
+                # Ignore any location older than 15 minutes (900 seconds)
+                if current_time - ts > 900:
+                    continue
+
+                old_ts = str(latest_locs.get(uid, {}).get("timestamp", "0"))
+                if ts_str >= old_ts:
+                    latest_locs[uid] = loc
+
+            nearby_temp = []
+            nearby_uids = set()
+
+            # Pass 1: Find locations strictly intersecting the radius
+            for other_id, loc in latest_locs.items():
+                if other_id == user_id: continue
+                
+                o_lat = safe_float(loc.get("latitude", loc.get("lat")))
+                o_lon = safe_float(loc.get("longitude", loc.get("lon")))
+                if o_lat is None or o_lon is None: continue
+                
+                dist = calculate_distance(latitude, longitude, o_lat, o_lon)
+                if dist <= radius:
+                    nearby_temp.append({
+                        "userId": other_id,
+                        "lat": o_lat,
+                        "lon": o_lon,
+                        "distanceM": round(dist, 2),
+                        "isSimulated": False
+                    })
+                    nearby_uids.add(other_id)
+
+            # Pass 2: Fetch user names and avatars ONLY for those nearby
+            users_details = fetch_users_details(nearby_uids)
+            
+            final_nearby = []
+            for n in nearby_temp:
+                details = users_details.get(n["userId"], {})
+                n["name"] = details.get("name", n["userId"]) 
+                n["email"] = details.get("email") # <--- Sends Email securely down to iOS Swift App
+                n["avatarUrl"] = details.get("avatarUrl")
+                n["profile_url"] = details.get("avatarUrl")
+                final_nearby.append(n)
+
+            # Sort users by distance 
+            final_nearby.sort(key=lambda x: x["distanceM"])
+
+            payload = {
+                "type": "nearbyUsers", 
+                "action": "nearbyUsers",
+                "count": len(final_nearby),
+                "users": final_nearby
+            }
+            send_ws_response(event, payload)
+            return {"statusCode": 200}
+            
+    except Exception as e:
+        print(f"❌ Fatal error: {e}")
+        send_ws_response(event, {"type": "error", "error": str(e)})
+        return {"statusCode": 200}
+    
+    return {"statusCode": 400}

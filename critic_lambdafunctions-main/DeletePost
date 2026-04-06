@@ -1,0 +1,102 @@
+import json
+import os
+import boto3
+
+# -------- Config --------
+TABLE_NAME = os.getenv("POSTS_TABLE", "poststable")
+
+dynamodb = boto3.resource("dynamodb")
+table = dynamodb.Table(TABLE_NAME)
+
+
+# -------- Helpers --------
+def _resp(status, body):
+    return {
+        "statusCode": status,
+        "headers": {
+            "Access-Control-Allow-Origin": "*",
+            "Access-Control-Allow-Headers": "Content-Type,Authorization",
+            "Access-Control-Allow-Methods": "OPTIONS,GET,POST,DELETE",
+            "Content-Type": "application/json",
+        },
+        "body": json.dumps(body),
+    }
+
+
+def _http_method(event):
+    # Works for API Gateway & Function URLs
+    m = (
+        event.get("requestContext", {})
+        .get("http", {})
+        .get("method", event.get("httpMethod"))
+    )
+    return (m or "GET").upper()
+
+
+def _get_post_id(event):
+    # 1) API Gateway pathParameters
+    pp = event.get("pathParameters") or {}
+    if isinstance(pp, dict) and pp.get("postId"):
+        return pp["postId"]
+
+    # 2) Function URL / rawPath (e.g., "/delete/123" or "/123")
+    raw_path = event.get("rawPath") or event.get("path") or ""
+    parts = [p for p in raw_path.split("/") if p]
+    if parts:
+        last = parts[-1]
+        if last.lower() not in {"delete"}:
+            return last
+
+    # 3) Query string: ?postId=...
+    qs = event.get("queryStringParameters") or {}
+    if isinstance(qs, dict) and qs.get("postId"):
+        return qs["postId"]
+
+    # 4) JSON body: {"postId":"..."}
+    body = event.get("body")
+    if isinstance(body, str):
+        try:
+            body = json.loads(body or "{}")
+        except Exception:
+            body = {}
+    if isinstance(body, dict):
+        return body.get("postId") or body.get("post_id")
+
+    return None
+
+
+# -------- Handler --------
+def lambda_handler(event, context):
+    method = _http_method(event)
+
+    # CORS preflight
+    if method == "OPTIONS":
+        return _resp(200, {"ok": True})
+
+    post_id = _get_post_id(event)
+    if not post_id:
+        return _resp(400, {"error": "Missing postId"})
+
+    # Allow both POST and DELETE to perform deletion
+    if method not in {"DELETE", "POST"}:
+        return _resp(405, {"error": f"Method {method} not allowed"})
+
+    try:
+        result = table.delete_item(
+            Key={"postId": post_id},
+            ReturnValues="ALL_OLD",  # return deleted item if existed
+        )
+
+        if "Attributes" in result:
+            return _resp(
+                200,
+                {
+                    "message": "Post deleted successfully",
+                    "deletedPost": result["Attributes"],
+                },
+            )
+        else:
+            return _resp(404, {"error": "Post not found"})
+
+    except Exception as e:
+        return _resp(500, {"error": f"Error deleting post: {str(e)}"})

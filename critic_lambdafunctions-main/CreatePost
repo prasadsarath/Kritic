@@ -1,0 +1,54 @@
+import json
+import boto3
+import uuid
+from datetime import datetime
+
+dynamodb = boto3.resource('dynamodb')
+table = dynamodb.Table('poststable')
+
+def lambda_handler(event, context):
+    # Extract the body from the event
+    body = json.loads(event.get('body', '{}'))
+    
+    # Generate postId and other data
+    post_id = str(uuid.uuid4())  # Generate a unique postId
+    created_at = datetime.utcnow().isoformat()  # Timestamp for createdAt
+
+    # Required fields for creating a post
+    post_content = body.get('postcontent')
+    post_status = body.get('poststatus')
+    receiver_id = body.get('receiverId')
+    sender_id = body.get('senderId')
+    is_scheduled = body.get('isscheduled', False)  # Default to False if not provided
+
+    # Validate required fields
+    if not post_content or not post_status or not receiver_id or not sender_id:
+        return {
+            'statusCode': 400,
+            'body': json.dumps('Missing required fields')
+        }
+
+    # Save to DynamoDB
+    try:
+        response = table.put_item(
+            Item={
+                'postId': post_id,
+                'createdAt': created_at,
+                'postcontent': post_content,
+                'poststatus': post_status,
+                'receiverId': receiver_id,
+                'senderId': sender_id,
+                'isscheduled': is_scheduled
+            }
+        )
+
+        return {
+            'statusCode': 201,
+            'body': json.dumps({'postId': post_id, 'message': 'Post created successfully'})
+        }
+
+    except Exception as e:
+        return {
+            'statusCode': 500,
+            'body': json.dumps(f'Error creating post: {str(e)}')
+        }

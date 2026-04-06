@@ -1,0 +1,64 @@
+import json
+import boto3
+from datetime import datetime
+
+dynamodb = boto3.resource('dynamodb')
+table = dynamodb.Table('poststable')
+
+def lambda_handler(event, context):
+    post_id = event.get('pathParameters', {}).get('postId')  # Retrieve postId from URL path parameters
+    if not post_id:
+        return {
+            'statusCode': 400,
+            'body': json.dumps('Missing postId in request')
+        }
+
+    body = json.loads(event.get('body', '{}'))
+
+    # Fields to update
+    post_content = body.get('postcontent')
+    post_status = body.get('poststatus')
+    receiver_id = body.get('receiverId')
+    sender_id = body.get('senderId')
+    is_scheduled = body.get('isscheduled')
+
+    update_expression = "SET"
+    expression_values = {}
+
+    # Dynamically build the update expression
+    if post_content:
+        update_expression += " postcontent = :postcontent,"
+        expression_values[':postcontent'] = post_content
+    if post_status:
+        update_expression += " poststatus = :poststatus,"
+        expression_values[':poststatus'] = post_status
+    if receiver_id:
+        update_expression += " receiverId = :receiverId,"
+        expression_values[':receiverId'] = receiver_id
+    if sender_id:
+        update_expression += " senderId = :senderId,"
+        expression_values[':senderId'] = sender_id
+    if is_scheduled is not None:
+        update_expression += " isscheduled = :isscheduled,"
+        expression_values[':isscheduled'] = is_scheduled
+
+    update_expression = update_expression.rstrip(",")  # Remove trailing comma
+
+    try:
+        response = table.update_item(
+            Key={'postId': post_id},
+            UpdateExpression=update_expression,
+            ExpressionAttributeValues=expression_values,
+            ReturnValues="UPDATED_NEW"
+        )
+
+        return {
+            'statusCode': 200,
+            'body': json.dumps({'message': 'Post updated successfully', 'updatedFields': response['Attributes']})
+        }
+
+    except Exception as e:
+        return {
+            'statusCode': 500,
+            'body': json.dumps(f'Error updating post: {str(e)}')
+        }

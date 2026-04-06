@@ -1,0 +1,132 @@
+import json, os, re, boto3
+from botocore.exceptions import ClientError
+
+AWS_REGION = os.environ.get("AWS_REGION", "us-east-1")
+TABLE_NAME = os.environ.get("TABLE_NAME", "Users")
+
+ddb   = boto3.resource("dynamodb", region_name=AWS_REGION)
+USERS = ddb.Table(TABLE_NAME)
+
+def _cors():
+    return {
+        "Access-Control-Allow-Origin": "*",
+        "Access-Control-Allow-Headers": "Content-Type,Authorization",
+        "Access-Control-Allow-Methods": "OPTIONS,POST"
+    }
+
+# --- simple US E.164 normalizer ---------------------------------------------
+def to_e164_us(raw: str | None) -> str | None:
+    if not raw:
+        return None
+    s = re.sub(r"[^\d+]", "", str(raw))
+    if s.startswith("+"):
+        return s
+    digits = re.sub(r"\D", "", s)
+    if len(digits) == 11 and digits.startswith("1"):
+        return f"+{digits}"
+    if len(digits) == 10:
+        return f"+1{digits}"
+    return None
+
+# --- fetch caller's stored phone so we can exclude it -----------------------
+def get_user_phone(user_id: str) -> str | None:
+    try:
+        resp = USERS.get_item(Key={"userId": user_id})
+        item = resp.get("Item")
+        if not item:
+            print(f"[diag] get_user_phone: no item for userId={user_id}")
+            return None
+        raw = item.get("phoneE164") or item.get("phone")
+        norm = to_e164_us(raw)
+        print(f"[diag] get_user_phone: raw={raw} norm={norm}")
+        return norm
+    except Exception as e:
+        print(f"[error] get_user_phone: {e}")
+        return None
+
+# --- scan with pagination (ProjectionExpression is safe) --------------------
+def scan_users():
+    items, start_key = [], None
+    while True:
+        kwargs = {
+            "ProjectionExpression": "userId, #n, phoneE164, phone",
+            "ExpressionAttributeNames": {"#n": "name"},
+        }
+        if start_key:
+            kwargs["ExclusiveStartKey"] = start_key
+        resp = USERS.scan(**kwargs)
+        items.extend(resp.get("Items", []))
+        start_key = resp.get("LastEvaluatedKey")
+        if not start_key:
+            break
+    print(f"[diag] scan_users: total_items={len(items)}")
+    return items
+
+def lambda_handler(event, context):
+    if event.get("httpMethod") == "OPTIONS":
+        return {"statusCode": 204, "headers": _cors(), "body": ""}
+
+    try:
+        body = json.loads(event.get("body") or "{}")
+        user_id = body.get("userId") or body.get("excludeUserId")
+        phones_in = body.get("phoneNumbers") or []
+        if not isinstance(phones_in, list):
+            raise ValueError("phoneNumbers must be an array")
+
+        print(f"[diag] incoming: userId={user_id} phones_in={phones_in}")
+        contacts = sorted({p for p in (to_e164_us(p) for p in phones_in) if p})
+        print(f"[diag] normalized_contacts={contacts}")
+
+        # determine what to exclude
+        exclude_phone = get_user_phone(user_id) if user_id else None
+        print(f"[diag] exclude_by userId={user_id} phone={exclude_phone}")
+
+        # load users
+        all_users = scan_users()
+
+        # build phone→user map, skipping the caller by userId or phone
+        phone_map = {}
+        for it in all_users:
+            uid = it.get("userId")
+            raw = it.get("phoneE164") or it.get("phone")
+            norm = to_e164_us(raw)
+
+            # skip self by userId
+            if user_id and uid == user_id:
+                print(f"[diag] skip self by userId: {uid}")
+                continue
+
+            # skip self by phone (defensive)
+            if exclude_phone and norm and norm == exclude_phone:
+                print(f"[diag] skip self by phone: {norm}")
+                continue
+
+            if norm:
+                phone_map[norm] = it
+
+        registered = []
+        found = set()
+        for ph in contacts:
+            it = phone_map.get(ph)
+            if not it:
+                continue
+            registered.append({
+                "phone": ph,
+                "userId": it.get("userId"),
+                "name": it.get("name")
+            })
+            found.add(ph)
+
+        unregistered = [p for p in contacts if p not in found]
+
+        print(f"[diag] out: registered={len(registered)} unregistered={len(unregistered)}")
+
+        return {
+            "statusCode": 200,
+            "headers": _cors(),
+            "body": json.dumps({"registered": registered, "unregistered": unregistered})
+        }
+
+    except Exception as e:
+        print(f"[error] {e}")
+        return {"statusCode": 400, "headers": _cors(), "body": json.dumps({"error": str(e)})}

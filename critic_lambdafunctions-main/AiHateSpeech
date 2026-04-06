@@ -1,0 +1,134 @@
+import json
+import os
+import requests
+
+def lambda_handler(event, context):
+    try:
+        # Extract and parse the JSON body from the POST request
+        body = json.loads(event.get("body", "{}"))
+        user_input = body.get("user_input", "")
+
+        if not user_input:
+            return {
+                "statusCode": 400,
+                "body": json.dumps({"error": "Missing 'user_input'"})
+            }
+
+        # Prompt for classification
+        system_prompt = (
+            "You are a classifier. Respond ONLY with 'true' or 'false'.\n"
+            "- true = message contains hate speech, offensive, or bad language.\n"
+            "- false = message is safe.\n"
+            "No explanations, no extra text."
+        )
+
+        provider = os.getenv("AI_PROVIDER", "openai").lower()
+        model = "gpt-4o"
+
+        match provider:
+            case "openai":
+                return call_openai(user_input, model, system_prompt)
+            case "anthropic":
+                return call_anthropic(user_input, model, system_prompt)
+            case "google":
+                return call_google(user_input, model, system_prompt)
+            case "mistral":
+                return call_mistral(user_input, model, system_prompt)
+            case _:
+                return {"statusCode": 400, "body": json.dumps({"error": f"Unsupported AI_PROVIDER: {provider}"})}
+
+    except Exception as e:
+        return {"statusCode": 500, "body": json.dumps({"error": str(e)})}
+
+
+# -------- Provider Handlers --------
+
+def call_openai(user_input, model, system_prompt):
+    url = "https://api.openai.com/v1/chat/completions"
+    headers = {
+        "Authorization": f"Bearer {os.environ['OPENAI_API_KEY']}",
+        "Content-Type": "application/json"
+    }
+    payload = {
+        "model": model,
+        "messages": [
+            {"role": "system", "content": system_prompt},
+            {"role": "user", "content": user_input}
+        ],
+        "temperature": 0
+    }
+    response = requests.post(url, headers=headers, json=payload)
+    data = response.json()
+    result = data["choices"][0]["message"]["content"].strip().lower()
+    is_offensive = result == "true"
+    return {
+        "statusCode": 200,
+        "body": json.dumps(is_offensive)
+    }
+
+
+def call_anthropic(user_input, model, system_prompt):
+    url = "https://api.anthropic.com/v1/messages"
+    headers = {
+        "x-api-key": os.environ["ANTHROPIC_API_KEY"],
+        "anthropic-version": "2023-06-01",
+        "Content-Type": "application/json"
+    }
+    payload = {
+        "model": model,
+        "system": system_prompt,
+        "messages": [{"role": "user", "content": user_input}],
+        "max_tokens": 10
+    }
+    response = requests.post(url, headers=headers, json=payload)
+    data = response.json()
+    result = data["content"][0]["text"].strip().lower()
+    is_offensive = result == "true"
+    return {
+        "statusCode": 200,
+        "body": json.dumps(is_offensive)
+    }
+
+
+def call_google(user_input, model, system_prompt):
+    url = f"https://generativelanguage.googleapis.com/v1beta/models/{model}:generateContent"
+    headers = {
+        "Authorization": f"Bearer {os.environ['GOOGLE_API_KEY']}",
+        "Content-Type": "application/json"
+    }
+    prompt_text = f"{system_prompt}\n\n{user_input}"
+    payload = {
+        "contents": [{"parts": [{"text": prompt_text}]}]
+    }
+    response = requests.post(url, headers=headers, json=payload)
+    data = response.json()
+    result = data["candidates"][0]["content"]["parts"][0]["text"].strip().lower()
+    is_offensive = result == "true"
+    return {
+        "statusCode": 200,
+        "body": json.dumps(is_offensive)
+    }
+
+
+def call_mistral(user_input, model, system_prompt):
+    url = "https://api.mistral.ai/v1/chat/completions"
+    headers = {
+        "Authorization": f"Bearer {os.environ['MISTRAL_API_KEY']}",
+        "Content-Type": "application/json"
+    }
+    payload = {
+        "model": model,
+        "messages": [
+            {"role": "system", "content": system_prompt},
+            {"role": "user", "content": user_input}
+        ],
+        "temperature": 0
+    }
+    response = requests.post(url, headers=headers, json=payload)
+    data = response.json()
+    result = data["choices"][0]["message"]["content"].strip().lower()
+    is_offensive = result == "true"
+    return {
+        "statusCode": 200,
+        "body": json.dumps(is_offensive)
+    }

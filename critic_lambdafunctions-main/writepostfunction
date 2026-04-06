@@ -1,0 +1,45 @@
+import json, os, uuid, boto3
+from datetime import datetime, timezone
+
+DDB = boto3.resource("dynamodb", region_name="us-east-1")
+TABLE = DDB.Table(os.environ.get("TABLE_NAME", "poststable"))
+
+def _cors():
+    return {
+        "Access-Control-Allow-Origin": "*",
+        "Access-Control-Allow-Headers": "Content-Type,Authorization",
+        "Access-Control-Allow-Methods": "GET,OPTIONS,POST"
+    }
+
+def lambda_handler(event, context):
+    # CORS preflight
+    if event.get("httpMethod") == "OPTIONS":
+        return {"statusCode": 204, "headers": _cors(), "body": ""}
+
+    try:
+        body = json.loads(event.get("body") or "{}")
+    except Exception:
+        return {"statusCode": 400, "headers": _cors(), "body": json.dumps({"error":"invalid JSON body"})}
+
+    # REQUIRED: take senderId from client (set by the app from the Cognito sub)
+    sender_id = (body.get("senderId") or "").strip()
+    if not sender_id:
+        return {"statusCode": 400, "headers": _cors(), "body": json.dumps({"error":"senderId required"})}
+
+    # Defaults / server stamps
+    body.setdefault("postId", str(uuid.uuid4()))
+    body.setdefault("createdAt", datetime.now(timezone.utc).isoformat())
+    body.setdefault("isscheduled", False)
+    body.setdefault("poststatus", "1" if not body.get("isscheduled") else "0")
+
+    # Optional minimal validation: must have content
+    if not (body.get("postcontent") or "").strip():
+        return {"statusCode": 400, "headers": _cors(), "body": json.dumps({"error":"postcontent required"})}
+
+    # Write
+    TABLE.put_item(Item=body)
+    return {
+        "statusCode": 201,
+        "headers": _cors(),
+        "body": json.dumps({"message":"Saved","postId":body["postId"]})
+    }
